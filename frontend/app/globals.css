@@ -1,0 +1,143 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --ink: #1A1A1A;
+    --paper: #F7F5F2;
+    --accent: #E85D3F;
+    --accent-muted: #F4A896;
+    --success: #2D6A4F;
+    --error: #C0392B;
+    --surface: #EDEAE6;
+    --muted: #6B6560;
+    --border: #D4CFC8;
+  }
+
+  body {
+    @apply bg-paper text-ink antialiased;
+    font-family: var(--font-inter), sans-serif;
+  }
+}
+
+@layer components {
+  /* Pulse animation for live indicator */
+  @keyframes pulse-ring {
+    0% { transform: scale(0.8); opacity: 1; }
+    100% { transform: scale(2.2); opacity: 0; }
+  }
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .pulse-container {
+    @apply relative w-2 h-2;
+  }
+  .pulse-ring {
+    @apply absolute inset-0 rounded-full bg-accent;
+    animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+  }
+  .pulse-dot {
+    @apply absolute inset-0 rounded-full bg-accent;
+    animation: pulse-dot 2s ease-in-out infinite;
+  }
+
+  /* Message animation */
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .msg-appear {
+    animation: slideIn 0.25s ease-out;
+  }
+
+  .markdown-content > :first-child {
+    @apply mt-0;
+  }
+  .markdown-content > :last-child {
+    @apply mb-0;
+  }
+  .markdown-content p,
+  .markdown-content ul,
+  .markdown-content ol,
+  .markdown-content pre,
+  .markdown-content blockquote,
+  .markdown-content table {
+    @apply my-3;
+  }
+  .markdown-content ul {
+    @apply list-disc pl-5;
+  }
+  .markdown-content ol {
+    @apply list-decimal pl-5;
+  }
+  .markdown-content li + li {
+    @apply mt-1;
+  }
+  .markdown-content a {
+    @apply underline underline-offset-2 text-accent;
+  }
+  .markdown-content code {
+    @apply px-1 py-0.5 bg-paper/70 font-mono text-[0.85em];
+  }
+  .markdown-content pre {
+    @apply overflow-x-auto p-3 bg-ink text-paper;
+  }
+  .markdown-content pre code {
+    @apply p-0 bg-transparent text-inherit;
+  }
+  .markdown-content blockquote {
+    @apply border-l-2 border-accent pl-3 text-muted;
+  }
+  .markdown-content table {
+    @apply block max-w-full overflow-x-auto border-collapse;
+  }
+  .markdown-content th,
+  .markdown-content td {
+    @apply border border-border px-2 py-1.5 text-left;
+  }
+  .markdown-content th {
+    @apply bg-paper/70 font-semibold;
+  }
+
+  /* Data table */
+  .data-table {
+    @apply w-full border-collapse;
+  }
+  .data-table th {
+    @apply text-left px-4 py-3 font-mono text-[11px] uppercase tracking-widest text-muted border-b border-border font-medium;
+  }
+  .data-table td {
+    @apply px-4 py-3.5 text-[13px] border-b border-surface;
+  }
+  .data-table tr:hover td {
+    @apply bg-surface;
+  }
+  .data-table tr.error-row td {
+    @apply bg-error/5;
+  }
+  .data-table tr.error-row:hover td {
+    @apply bg-error/10;
+  }
+
+  /* Chat input */
+  .chat-input:focus {
+    @apply outline-none border-accent;
+  }
+
+  /* Nav link active indicator */
+  .nav-link {
+    @apply relative;
+  }
+  .nav-link.active::after {
+    content: "";
+    @apply absolute -bottom-0.5 left-0 right-0 h-0.5 bg-accent;
+  }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
