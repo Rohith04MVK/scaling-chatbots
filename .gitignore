@@ -14,8 +14,9 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Only ignore packaging dirs at repo root — do not ignore frontend/lib.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
