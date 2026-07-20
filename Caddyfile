@@ -1,0 +1,11 @@
+# Single entrypoint for AWS (EC2 security group: open 80, optionally 443).
+# UI lives at /chat (Next.js basePath). Everything else goes to the API.
+:80 {
+	handle /chat* {
+		reverse_proxy frontend:3000
+	}
+
+	handle {
+		reverse_proxy api:8000
+	}
+}

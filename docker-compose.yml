@@ -15,10 +15,22 @@ services:
     ports:
       - "5432:5432"
 
+  redis:
+    image: redis:7-alpine
+    # Dev-only: no AOF/RDB. Production should enable and tune persistence.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "6379:6379"
+
   api:
     build: .
     environment:
       CHATLOG_DATABASE_URL: postgresql+asyncpg://chatlog:chatlog@db:5432/chatlog
+      CHATLOG_REDIS_URL: redis://redis:6379/0
       CHATLOG_CORS_ORIGINS: http://localhost:3000
       CHATLOG_GROQ_API_KEY: ${CHATLOG_GROQ_API_KEY:-}
     volumes:
@@ -33,11 +45,33 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "8000:8000"
 
+  consumer:
+    build: .
+    environment:
+      CHATLOG_DATABASE_URL: postgresql+asyncpg://chatlog:chatlog@db:5432/chatlog
+      CHATLOG_REDIS_URL: redis://redis:6379/0
+      CHATLOG_REDIS_CONSUMER_NAME: consumer-1
+    volumes:
+      - ./backend:/app/backend
+      - ./sdk:/app/sdk
+      - ./shared:/app/shared
+    command: ["uv", "run", "python", "backend/consumer.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      target: dev
     environment:
       # Browser calls the API on the host, not the Docker network name.
       NEXT_PUBLIC_API_URL: http://localhost:8000

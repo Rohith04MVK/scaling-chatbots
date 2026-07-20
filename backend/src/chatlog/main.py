@@ -7,11 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from chatlog.api import conversations, logs, providers, stats
 from chatlog.config import get_settings
 from chatlog.db.session import engine
+from chatlog.services.stream import close_redis
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
+    await close_redis()
     await engine.dispose()
 
 

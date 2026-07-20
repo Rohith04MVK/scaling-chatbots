@@ -85,7 +85,7 @@ export default function StatsPage() {
         </div>
         <div className="flex gap-6">
           <Link
-            href="/chat"
+            href="/"
             className="bg-transparent border-none font-body text-[13px] text-muted hover:text-ink transition-colors"
           >
             Chat

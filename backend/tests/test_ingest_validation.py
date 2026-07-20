@@ -1,35 +1,18 @@
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from chatlog.api.dependencies import get_log_store
-from chatlog.api.schemas import InferenceLogCreate
 from chatlog.main import app
 from httpx import ASGITransport, AsyncClient
 
 
-class RecordingLogStore:
-    def __init__(self) -> None:
-        self.payloads: list[InferenceLogCreate] = []
-
-    async def write(self, payload: InferenceLogCreate) -> uuid.UUID:
-        self.payloads.append(payload)
-        return uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-
-
 @pytest.fixture
-def store() -> RecordingLogStore:
-    return RecordingLogStore()
-
-
-@pytest.fixture
-async def client(store: RecordingLogStore) -> AsyncIterator[AsyncClient]:
-    app.dependency_overrides[get_log_store] = lambda: store
+async def client() -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as test_client:
         yield test_client
-    app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -63,42 +46,75 @@ def valid_payload() -> dict[str, Any]:
 )
 async def test_ingest_rejects_malformed_payloads(
     client: AsyncClient,
-    store: RecordingLogStore,
     valid_payload: dict[str, Any],
     change: dict[str, Any],
 ) -> None:
-    response = await client.post("/logs/ingest", json=valid_payload | change)
+    with patch(
+        "chatlog.api.logs.publish_inference_log",
+        new=AsyncMock(),
+    ) as publish:
+        response = await client.post("/logs/ingest", json=valid_payload | change)
 
     assert response.status_code == 422
     assert response.json()["detail"]
-    assert store.payloads == []
+    publish.assert_not_awaited()
 
 
 async def test_ingest_rejects_missing_required_field(
     client: AsyncClient,
-    store: RecordingLogStore,
     valid_payload: dict[str, Any],
 ) -> None:
     valid_payload.pop("model")
 
-    response = await client.post("/logs/ingest", json=valid_payload)
+    with patch(
+        "chatlog.api.logs.publish_inference_log",
+        new=AsyncMock(),
+    ) as publish:
+        response = await client.post("/logs/ingest", json=valid_payload)
 
     assert response.status_code == 422
     assert response.json()["detail"][0]["loc"] == ["body", "model"]
-    assert store.payloads == []
+    publish.assert_not_awaited()
 
 
-async def test_ingest_redacts_previews_before_writing(
+async def test_ingest_enqueues_validated_payload_without_redacting(
     client: AsyncClient,
-    store: RecordingLogStore,
     valid_payload: dict[str, Any],
 ) -> None:
-    response = await client.post("/logs/ingest", json=valid_payload)
+    # Edge validation only — redaction is the consumer's job.
+    with patch(
+        "chatlog.api.logs.publish_inference_log",
+        new=AsyncMock(return_value="1710000000000-0"),
+    ) as publish:
+        response = await client.post("/logs/ingest", json=valid_payload)
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert response.json() == {
-        "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         "accepted": True,
+        "stream_id": "1710000000000-0",
+        "warning": None,
     }
-    assert store.payloads[0].input_preview == "Hello from <EMAIL_ADDRESS>"
-    assert store.payloads[0].output_preview == "Call <PHONE_NUMBER>"
+    published = publish.await_args.args[0]
+    assert published.input_preview == "Hello from person@example.com"
+    assert published.output_preview == "Call 415-555-2671"
+    assert published.conversation_id == uuid.UUID("11111111-1111-1111-1111-111111111111")
+
+
+async def test_ingest_returns_202_with_warning_when_redis_unreachable(
+    client: AsyncClient,
+    valid_payload: dict[str, Any],
+) -> None:
+    from chatlog.services.stream import StreamPublishError
+
+    with patch(
+        "chatlog.api.logs.publish_inference_log",
+        new=AsyncMock(side_effect=StreamPublishError("connection refused")),
+    ):
+        response = await client.post("/logs/ingest", json=valid_payload)
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["stream_id"] is None
+    assert body["warning"] is not None
+    assert "redis_unavailable" in body["warning"]

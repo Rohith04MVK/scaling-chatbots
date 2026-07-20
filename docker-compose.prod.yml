@@ -1,0 +1,109 @@
+# Production stack for AWS EC2 (or any VM).
+# Usage:
+#   cp .env.example .env   # set PUBLIC_HOST + CHATLOG_GROQ_API_KEY
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# PUBLIC_HOST must be the URL browsers use, e.g. http://3.14.15.16 or
+# http://ec2-….amazonaws.com (no trailing slash, no :80).
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-chatlog}
+      POSTGRES_USER: ${POSTGRES_USER:-chatlog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatlog}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatlog} -d ${POSTGRES_DB:-chatlog}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    # Not published — only reachable on the Docker network.
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment:
+      CHATLOG_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-chatlog}:${POSTGRES_PASSWORD:-chatlog}@db:5432/${POSTGRES_DB:-chatlog}
+      CHATLOG_REDIS_URL: redis://redis:6379/0
+      CHATLOG_CORS_ORIGINS: ${PUBLIC_HOST:-http://localhost}
+      CHATLOG_GROQ_API_KEY: ${CHATLOG_GROQ_API_KEY:-}
+    command:
+      - /bin/sh
+      - -c
+      - uv run alembic upgrade head && uv run uvicorn chatlog.main:app --host 0.0.0.0 --port 8000 --workers 2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "uv",
+          "run",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  consumer:
+    build: .
+    environment:
+      CHATLOG_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-chatlog}:${POSTGRES_PASSWORD:-chatlog}@db:5432/${POSTGRES_DB:-chatlog}
+      CHATLOG_REDIS_URL: redis://redis:6379/0
+      CHATLOG_REDIS_CONSUMER_NAME: ${CHATLOG_REDIS_CONSUMER_NAME:-consumer-1}
+    command: ["uv", "run", "python", "backend/consumer.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      target: prod
+      args:
+        # Baked into the Next.js client bundle at build time.
+        NEXT_PUBLIC_API_URL: ${PUBLIC_HOST:-http://localhost}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+      - frontend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

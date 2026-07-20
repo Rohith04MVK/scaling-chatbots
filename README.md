@@ -13,16 +13,121 @@ Docker is the shortest path. From the project root:
 docker compose up --build
 ```
 
-The stack starts PostgreSQL, the API, and the Next.js frontend. The API waits for
-PostgreSQL, applies Alembic migrations, and listens at
-<http://localhost:8000>. The UI is at <http://localhost:3000>. OpenAPI docs are
-at <http://localhost:8000/docs>. In another terminal, add demo data:
+The stack starts PostgreSQL, Redis, the API, an independent log consumer, and
+the Next.js frontend. The API waits for PostgreSQL and Redis, applies Alembic
+migrations, and listens at <http://localhost:8000>. The UI is at
+<http://localhost:3000/chat>. OpenAPI docs are at <http://localhost:8000/docs>. In
+another terminal, add demo data:
 
 ```bash
 docker compose exec api uv run python backend/scripts/seed.py
 ```
 
-For local development with PostgreSQL already available:
+## Deploy on AWS (EC2)
+
+The production Compose file runs the same stack behind Caddy on port **80**:
+UI at `/chat`, API (and `/docs`, `/health`) on the same host. Postgres and Redis
+stay on the Docker network only.
+
+### 1. Launch the instance
+
+1. AMI: **Amazon Linux 2023** (or Ubuntu 22.04+).
+2. Instance: **t3.medium** or larger (spaCy/Presidio needs RAM; t3.small often OOMs).
+3. Storage: **20 GB** gp3.
+4. Security group inbound:
+   - **22** from your IP (SSH)
+   - **80** from `0.0.0.0/0` (or your IP while testing)
+5. Allocate an Elastic IP if you want a stable address.
+
+### 2. Install Docker on the instance
+
+SSH in, then:
+
+```bash
+# Amazon Linux 2023
+sudo dnf update -y
+sudo dnf install -y docker git
+sudo systemctl enable --now docker
+sudo usermod -aG docker ec2-user
+# log out and back in so the docker group applies
+exit
+```
+
+```bash
+# Ubuntu
+sudo apt-get update -y
+sudo apt-get install -y docker.io docker-compose-v2 git
+sudo systemctl enable --now docker
+sudo usermod -aG docker ubuntu
+exit
+```
+
+Install Compose plugin if `docker compose` is missing (Amazon Linux):
+
+```bash
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+sudo curl -SL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version
+```
+
+### 3. Clone, configure, start
+
+```bash
+git clone <YOUR_REPO_URL> scaling-chatbots
+cd scaling-chatbots
+
+# Public URL browsers will use (no trailing slash, no :80)
+PUBLIC_IP=$(curl -s http://checkip.amazonaws.com)
+cp .env.example .env
+sed -i "s|^PUBLIC_HOST=.*|PUBLIC_HOST=http://${PUBLIC_IP}|" .env
+sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 16)|" .env
+# Optional: set CHATLOG_GROQ_API_KEY=... in .env for Groq in the UI
+
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+First build pulls images and compiles the frontend with `NEXT_PUBLIC_API_URL`
+baked to `PUBLIC_HOST` (several minutes). Then:
+
+```bash
+# Wait until healthy
+docker compose -f docker-compose.prod.yml ps
+curl -s http://127.0.0.1/health
+
+# Optional demo data
+docker compose -f docker-compose.prod.yml exec api uv run python backend/scripts/seed.py
+```
+
+Open:
+
+- UI: `http://<PUBLIC_IP>/chat`
+- API docs: `http://<PUBLIC_IP>/docs`
+- Health: `http://<PUBLIC_IP>/health`
+
+### 4. Day-2 commands
+
+```bash
+# Logs
+docker compose -f docker-compose.prod.yml logs -f api consumer caddy
+
+# Rebuild after a git pull (required if PUBLIC_HOST or frontend changed)
+git pull
+docker compose -f docker-compose.prod.yml up -d --build
+
+# Stop
+docker compose -f docker-compose.prod.yml down
+
+# Stop and wipe DB/Redis volumes
+docker compose -f docker-compose.prod.yml down -v
+```
+
+If you later attach a domain or HTTPS (ALB, Cloudflare, or Caddy TLS), set
+`PUBLIC_HOST` to that URL (e.g. `https://logs.example.com`), rebuild the
+frontend, and point CORS at the same value.
+
+For local development with PostgreSQL and Redis already available:
 
 ```bash
 uv sync
@@ -31,12 +136,16 @@ uv sync
 #   uv run python -m spacy download en_core_web_sm
 uv run alembic upgrade head
 uv run python backend/scripts/seed.py
+# Terminal A — API (producer enqueues to Redis):
 uv run uvicorn chatlog.main:app --reload
+# Terminal B — independent consumer (stream → redact → Postgres):
+uv run python backend/consumer.py
 ```
 
-The default local URL is
-`postgresql+asyncpg://chatlog:chatlog@localhost:5432/chatlog`. Override it with
-`CHATLOG_DATABASE_URL`. Run checks with:
+The default local URLs are
+`postgresql+asyncpg://chatlog:chatlog@localhost:5432/chatlog` and
+`redis://localhost:6379/0`. Override with `CHATLOG_DATABASE_URL` /
+`CHATLOG_REDIS_URL`. Run checks with:
 
 ```bash
 uv run pytest
@@ -45,8 +154,12 @@ uv run ruff check .
 
 ## API
 
-- `POST /logs/ingest` validates an inference event, redacts PII from both
-  previews, commits it asynchronously, and returns the new log ID.
+- `POST /logs/ingest` validates an inference event at the edge, `XADD`s it onto
+  the `inference_logs` Redis Stream, and returns `202 Accepted` with the stream
+  entry ID. It does **not** write Postgres or redact — that is the consumer's
+  job. If Redis is unreachable, the endpoint still returns `202` with a
+  `warning` field (same fire-and-forget principle as the SDK) rather than
+  failing the caller with `500`.
 - `POST /conversations` creates a conversation from its first user message and
   appends an assistant response from the selected provider.
 - `GET /providers` lists supported LLM providers, default models, and whether a
@@ -62,8 +175,9 @@ uv run ruff check .
   latency time-series points, and recent log rows for the observability console.
 
 FastAPI/Pydantic returns structured `422` responses for malformed request
-bodies. An unknown ingestion `conversation_id` also returns `422`, since the
-event is well-formed but cannot satisfy the database relationship.
+bodies. Unknown `conversation_id` values are no longer rejected at ingest time
+(the producer never talks to Postgres); a bad FK fails in the consumer and,
+after enough retries, lands on the DLQ stream.
 
 ## Schema
 
@@ -117,11 +231,51 @@ make ownership and future extraction visible without adding infrastructure.
 This is appropriate for modest event volume, where operational simplicity is
 more valuable than specialized analytical throughput.
 
-The endpoint awaits one async database commit. That avoids blocking a worker
-thread and confirms durability before responding. `LogStore` is the narrow
-write interface; `PostgresLogStore` is its only implementation. PII redaction
-runs in the ingestion service before that interface, so a future sink cannot
-accidentally bypass the server-side pass.
+### Ingestion flow (Redis Streams)
+
+Producers never write Postgres. After edge validation they only append to a
+Redis Stream; an independent consumer process owns redaction and persistence:
+
+```text
+SDK (or chat API)
+  → POST /logs/ingest  (or in-process publish from conversations)
+  → Pydantic validate
+  → Redis XADD  inference_logs
+       │
+       │  [decoupled — producer returns 202 here]
+       ▼
+  consumer group (backend/consumer.py)
+  → XREADGROUP
+  → redact()  (second-pass Presidio)
+  → Postgres analytics.inference_logs
+  → XACK  (only after a successful commit)
+
+  after N failed deliveries → XADD inference_logs_dlq + XACK
+  (production would alert on DLQ depth)
+```
+
+Compose runs the consumer as its own service next to the API, so the boundary
+is visible: kill the consumer, send chat messages, watch entries pile up
+(`XLEN inference_logs` / `XRANGE inference_logs - +`), restart the consumer,
+and it catches up. That backlog-and-drain behavior is the point of the pattern.
+
+This take-home uses one producer path and one consumer instance. Consumer
+groups already track pending vs acknowledged messages, so adding more consumer
+replicas later is a config/ops change (more processes with distinct consumer
+names in the same group), not a redesign.
+
+**Redis vs Kafka (honest tradeoff).** Redis Streams is a lighter-weight
+stand-in for Kafka here — fine for this scale and demo clarity. At production
+volume I would use Kafka for partitioning, longer retention, and
+multi-consumer-group fan-out (e.g. one group writes to Postgres, another feeds
+a real-time alerting service, off the same topic). Compose Redis also runs
+without AOF/RDB persistence; production would enable and tune persistence so a
+Redis restart cannot silently drop the stream.
+
+`LogStore` remains the narrow Postgres write interface used by the consumer
+(`PostgresLogStore` is its only implementation). PII redaction runs in the
+ingestion service on the consumer side, so a future sink cannot accidentally
+bypass the server-side pass.
 
 ### PII redaction (Presidio)
 
@@ -131,10 +285,11 @@ Redaction is a defense-in-depth pair, not a single choke point:
    the background delivery worker runs `redact()` on `input_preview` /
    `output_preview` before `POST /logs/ingest`. Redaction never sits on the
    synchronous chat path.
-2. **Backend (second pass)** — ingestion runs `redact()` again before writing
-   to Postgres. If this pass changes a preview, a debug log notes that the
-   caller may have bypassed SDK-side redaction (direct API use, or a future
-   adapter that forgot the SDK path).
+2. **Backend consumer (second pass)** — the stream consumer runs `redact()`
+   again before writing to Postgres. If this pass changes a preview, a debug
+   log notes that the caller may have bypassed SDK-side redaction (direct API
+   use, or a future adapter that forgot the SDK path). The HTTP ingest
+   endpoint does **not** redact; it only validates and enqueues.
 
 Only free-text preview fields (and, for this take-home, stored message
 `content`) are redacted. Structural metadata — model, timestamps,
@@ -181,12 +336,10 @@ scoping access, and redacting only derived surfaces (inference previews,
 exports, support tools). Redacting history here demonstrates the shared
 function end-to-end; it is not the production recommendation.
 
-At scale, I would put Kafka in front of ingestion for buffering, retries, and
-traffic smoothing, then batch events into ClickHouse for high-cardinality,
-long-window analytics. That design would return `202 Accepted` after durable
-enqueue and would need idempotency keys, consumer lag monitoring, a dead-letter
-policy, and an explicit consistency contract. Those costs are intentionally
-avoided here.
+At higher analytical volume I would still batch from the stream (or from Kafka)
+into ClickHouse for high-cardinality, long-window analytics, with idempotency
+keys, consumer-lag monitoring, and an explicit consistency contract beyond the
+basic DLQ this take-home ships.
 
 ## With more time
 
@@ -263,8 +416,8 @@ worker redacts `input_preview` / `output_preview` with Presidio, then sends
 `POST /logs/ingest` with a short timeout and retries once after a short
 backoff. A full queue, timeout, non-2xx response, or unavailable backend
 drops telemetry silently after that retry; none of these conditions can fail or
-delay the chatbot's LLM response. The backend still redacts again as defense
-in depth.
+delay the chatbot's LLM response. The backend consumer still redacts again as
+defense in depth after reading from the Redis Stream.
 
 Send-per-call is intentional at this size. Batching would improve network and
 ingestion efficiency at higher volume, but adds flush timing, partial-failure,
@@ -301,7 +454,7 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:3000>. `NEXT_PUBLIC_API_URL` defaults to
+Open <http://localhost:3000/chat>. `NEXT_PUBLIC_API_URL` defaults to
 `http://localhost:8000`.
 
 If you need `sudo` for Docker, keep the key in the project `.env` file

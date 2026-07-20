@@ -1,3 +1,4 @@
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -20,7 +21,6 @@ from chatlog.api.schemas import (
 from chatlog.config import get_settings
 from chatlog.models import Conversation, Message
 from chatlog.providers import default_provider_id, get_provider, resolve_model
-from chatlog.services.ingestion import LogIngestionService
 from chatlog.services.llm import (
     ChatMessage,
     Completion,
@@ -28,8 +28,10 @@ from chatlog.services.llm import (
     LLMConfigurationError,
     LLMProviderError,
 )
-from chatlog.services.log_store import PostgresLogStore
 from chatlog.services.redaction import redact
+from chatlog.services.stream import StreamPublishError, publish_inference_log
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -116,7 +118,6 @@ async def _complete_conversation(
             completion=None,
             latency_ms=latency_ms,
             error=exc,
-            session=session,
         )
         status_code = (
             status.HTTP_503_SERVICE_UNAVAILABLE
@@ -138,11 +139,9 @@ async def _complete_conversation(
         completion=completion,
         latency_ms=round((perf_counter() - started_at) * 1000),
         error=None,
-        session=session,
     )
     # Keep the assistant message durable before the API reloads the conversation.
-    # The current log store commits as part of ingestion; this explicit commit also
-    # preserves the invariant if that implementation changes to batch log writes.
+    # Inference logs are enqueued to Redis separately and do not share this commit.
     await session.commit()
 
 
@@ -183,7 +182,6 @@ async def _stream_conversation(
             completion=None,
             latency_ms=round((perf_counter() - started_at) * 1000),
             error=exc,
-            session=session,
         )
         yield _sse("error", {"detail": str(exc)})
         return
@@ -196,7 +194,6 @@ async def _stream_conversation(
             completion=None,
             latency_ms=round((perf_counter() - started_at) * 1000),
             error=error,
-            session=session,
         )
         yield _sse("error", {"detail": str(error)})
         return
@@ -219,7 +216,6 @@ async def _stream_conversation(
         completion=completion,
         latency_ms=round((perf_counter() - started_at) * 1000),
         error=None,
-        session=session,
     )
     await session.commit()
     yield _sse("done", {})
@@ -231,8 +227,9 @@ async def _write_inference_log(
     completion: Completion | None,
     latency_ms: int,
     error: Exception | None,
-    session: SessionDependency,
 ) -> None:
+    # Same producer path as POST /logs/ingest: validate + XADD. The consumer
+    # owns redaction and the Postgres write.
     latest_user_message = next(
         (message.content for message in reversed(conversation.messages) if message.role == "user"),
         "",
@@ -250,7 +247,11 @@ async def _write_inference_log(
         output_preview=completion.content[:8000] if completion else "",
         timestamp=datetime.now(UTC),
     )
-    await LogIngestionService(PostgresLogStore(session)).ingest(payload)
+    try:
+        await publish_inference_log(payload)
+    except StreamPublishError:
+        # Match SDK fire-and-forget: a logging outage must not fail the chat turn.
+        logger.exception("Redis unreachable while enqueueing conversation inference log")
 
 
 @router.post("", response_model=ConversationDetail, status_code=status.HTTP_201_CREATED)

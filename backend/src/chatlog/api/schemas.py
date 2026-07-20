@@ -37,8 +37,16 @@ class InferenceLogCreate(BaseModel):
 
 
 class InferenceLogAccepted(BaseModel):
-    id: uuid.UUID
+    """Accepted for async processing via Redis Streams.
+
+    ``stream_id`` is the Redis entry ID when XADD succeeds. ``warning`` is set
+    when Redis is unreachable — the request still returns 202 so a logging
+    outage cannot take down the chat path.
+    """
+
     accepted: Literal[True] = True
+    stream_id: str | None = None
+    warning: str | None = None
 
 
 class MessageResponse(BaseModel):

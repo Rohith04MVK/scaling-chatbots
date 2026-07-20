@@ -1,9 +1,11 @@
-from fastapi import APIRouter, HTTPException, status
+import logging
 
-from chatlog.api.dependencies import LogStoreDependency
+from fastapi import APIRouter, status
+
 from chatlog.api.schemas import InferenceLogAccepted, InferenceLogCreate
-from chatlog.services.ingestion import LogIngestionService
-from chatlog.services.log_store import ConversationNotFoundError
+from chatlog.services.stream import StreamPublishError, publish_inference_log
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/logs", tags=["logs"])
 
@@ -11,20 +13,19 @@ router = APIRouter(prefix="/logs", tags=["logs"])
 @router.post(
     "/ingest",
     response_model=InferenceLogAccepted,
-    status_code=status.HTTP_201_CREATED,
+    status_code=status.HTTP_202_ACCEPTED,
 )
-async def ingest_log(
-    payload: InferenceLogCreate,
-    store: LogStoreDependency,
-) -> InferenceLogAccepted:
-    # A direct async commit keeps the take-home deployment simple while avoiding
-    # thread blocking. At higher volume, this boundary can enqueue to Kafka and
-    # return 202, trading immediate durability feedback for lower tail latency.
+async def ingest_log(payload: InferenceLogCreate) -> InferenceLogAccepted:
+    """Validate at the edge, then XADD onto the inference Redis Stream.
+
+    The producer never writes Postgres. Redaction and persistence happen in the
+    independent consumer process after it reads from the stream.
+    """
     try:
-        log_id = await LogIngestionService(store).ingest(payload)
-    except ConversationNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="conversation_id does not reference an existing conversation",
-        ) from exc
-    return InferenceLogAccepted(id=log_id)
+        stream_id = await publish_inference_log(payload)
+    except StreamPublishError:
+        logger.exception("Redis unreachable while enqueueing inference log")
+        return InferenceLogAccepted(
+            warning="redis_unavailable: log not enqueued; chat path unaffected",
+        )
+    return InferenceLogAccepted(stream_id=stream_id)
