@@ -150,8 +150,12 @@ export default function ChatPage() {
     setInput("");
     setIsLoading(true);
     setError(null);
-    const temporaryAssistantId = `streaming-${crypto.randomUUID()}`;
-    const temporaryUserId = `pending-${crypto.randomUUID()}`;
+    // randomUUID needs a secure context (HTTPS/localhost); EC2 HTTP IP falls back.
+    const tempId = () =>
+      globalThis.crypto?.randomUUID?.() ??
+      `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const temporaryAssistantId = `streaming-${tempId()}`;
+    const temporaryUserId = `pending-${tempId()}`;
     const now = new Date().toISOString();
     const optimisticMessages: Message[] = [
       {
